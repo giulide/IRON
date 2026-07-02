@@ -15,3 +15,4 @@ from .swiglu_prefill.op import SwiGLUPrefill
 from .transpose.op import Transpose
 from .strided_copy.op import StridedCopy
 from .repeat.op import Repeat
+from .scalar_conv2d.op import ScalarConv2D
