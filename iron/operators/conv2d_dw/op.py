@@ -18,19 +18,22 @@ from iron.common.context import AIEContext
 
 
 @dataclass
-class ScalarConv2D(MLIROperator):
-    """AIE-accelerated scalar 2D convolution (single channel, single column)"""
+class Conv2DDW(MLIROperator):
+    """AIE-accelerated depthwise 2D convolution (multi-channel, multi-column)"""
 
+    c: int  # number of channels
     h: int  # input height
     w: int  # input width
     k_h: int  # kernel height
     k_w: int  # kernel width
     padding: int = 0
+    num_aie_columns: int = field(default=8)
     context: AIEContext | None = field(default=None, repr=False)
 
-    # Override default name aliases: use shorter aliases for conv2d fields
+    # Override default name aliases
     _name_aliases: ClassVar[dict[str, str]] = {
         **MLIROperator._name_aliases,
+        "c": "C",
         "h": "H",
         "w": "W",
         "k_h": "kh",
@@ -38,26 +41,33 @@ class ScalarConv2D(MLIROperator):
         "padding": "pad",
     }
 
+    def __post_init__(self):
+        if self.num_aie_columns > aie_utils.get_current_device().cols:
+            raise ValueError(
+                f"num_aie_columns ({self.num_aie_columns}) exceeds device columns"
+            )
+        super().__init__(context=self.context)
+
     def get_arg_spec(self) -> list[AIERuntimeArgSpec]:
         H_out = self.h + 2 * self.padding - self.k_h + 1
         W_out = self.w + 2 * self.padding - self.k_w + 1
         return [
-            AIERuntimeArgSpec("in", (self.h * self.w,)),      # input
-            AIERuntimeArgSpec("in", (self.k_h * self.k_w,)),  # weights
-            AIERuntimeArgSpec("out", (H_out * W_out,)),       # output
+            AIERuntimeArgSpec("in", (self.c * self.h * self.w,)),          # input
+            AIERuntimeArgSpec("in", (self.c * self.k_h * self.k_w,)),      # weights
+            AIERuntimeArgSpec("out", (self.c * H_out * W_out,)),           # output
         ]
 
     def _mlir_callback_args(self) -> list[Any]:
         """Arguments forwarded to the design.py callback."""
-        return [aie_utils.get_current_device(), self.h, self.w,
-                self.k_h, self.k_w, self.padding]
+        return [aie_utils.get_current_device(), self.c, self.h, self.w,
+                self.k_h, self.k_w, self.padding, self.num_aie_columns]
 
     def get_mlir_artifact(self) -> PythonGeneratedMLIRArtifact:
         return PythonGeneratedMLIRArtifact(
             f"{self.name}.mlir",
             DesignGenerator(
                 self.operator_dir / "design.py",
-                "conv2d_scalar",
+                "conv2d_dw_design",
                 tuple(self._mlir_callback_args()),
             ),
         )
@@ -65,13 +75,13 @@ class ScalarConv2D(MLIROperator):
     def get_kernel_artifacts(self) -> list[KernelObjectArtifact]:
         return [
             KernelObjectArtifact(
-                "scalar_conv.o",
+                "depthwise_conv.o",
                 dependencies=[
                     SourceArtifact(
                         self.context.base_dir
                         / "aie_kernels"
                         / "generic"
-                        / "scalar_conv.cc"
+                        / "depthwise_conv.cc"
                     )
                 ],
             )
