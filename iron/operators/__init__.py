@@ -16,3 +16,5 @@ from .transpose.op import Transpose
 from .strided_copy.op import StridedCopy
 from .repeat.op import Repeat
 from .scalar_conv2d.op import ScalarConv2D
+from .scalar_conv2d_dw.op import ScalarConv2DDW
+from .vector_conv2d_dw.op import VectorConv2DDW
