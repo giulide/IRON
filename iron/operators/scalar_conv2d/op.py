@@ -38,19 +38,39 @@ class ScalarConv2D(MLIROperator):
         "padding": "pad",
     }
 
+    def __post_init__(self):
+        super().__init__(context=self.context)
+
+    @property
+    def weight_size(self) -> int:
+        """Weight buffer size, rounded up to a multiple of 4 elements.
+
+        The shim DMA requires transfer lengths to be 4-byte-aligned (2 bf16
+        elements); we round up to 4 elements to match the padding done in
+        design.py. Callers must zero-pad the raw k_h*k_w weights to this size.
+        """
+        k_size = self.k_h * self.k_w
+        return (k_size + 3) // 4 * 4
+
     def get_arg_spec(self) -> list[AIERuntimeArgSpec]:
         H_out = self.h + 2 * self.padding - self.k_h + 1
         W_out = self.w + 2 * self.padding - self.k_w + 1
         return [
-            AIERuntimeArgSpec("in", (self.h * self.w,)),      # input
-            AIERuntimeArgSpec("in", (self.k_h * self.k_w,)),  # weights
-            AIERuntimeArgSpec("out", (H_out * W_out,)),       # output
+            AIERuntimeArgSpec("in", (self.h * self.w,)),  # input
+            AIERuntimeArgSpec("in", (self.weight_size,)),  # weights (padded)
+            AIERuntimeArgSpec("out", (H_out * W_out,)),  # output
         ]
 
     def _mlir_callback_args(self) -> list[Any]:
         """Arguments forwarded to the design.py callback."""
-        return [aie_utils.get_current_device(), self.h, self.w,
-                self.k_h, self.k_w, self.padding]
+        return [
+            aie_utils.get_current_device(),
+            self.h,
+            self.w,
+            self.k_h,
+            self.k_w,
+            self.padding,
+        ]
 
     def get_mlir_artifact(self) -> PythonGeneratedMLIRArtifact:
         return PythonGeneratedMLIRArtifact(

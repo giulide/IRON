@@ -15,7 +15,10 @@ def conv2d_scalar(dev, h, w, k_h, k_w, padding):
 
     # Tensor types
     tensor_in_ty = np.ndarray[(h * w,), np.dtype[bfloat16]]
-    tensor_w_ty = np.ndarray[(k_h * k_w,), np.dtype[bfloat16]]
+    # Shim DMA requires transfer lengths to be a multiple of 4 elements;
+    # pad the weight buffer accordingly (extra elements are unused by the kernel).
+    k_size_padded = (k_h * k_w + 3) // 4 * 4
+    tensor_w_ty = np.ndarray[(k_size_padded,), np.dtype[bfloat16]]
     tensor_out_ty = np.ndarray[(H_out * W_out,), np.dtype[bfloat16]]
 
     # Use the same types as tile types (no tiling for this 1-column design)
@@ -30,9 +33,18 @@ def conv2d_scalar(dev, h, w, k_h, k_w, padding):
 
     # Declare the C++ kernel
     conv_fn = Kernel(
-        "scalar_conv2d", "scalar_conv.o",
-        [tile_in_ty, tile_w_ty, tile_out_ty,
-         np.int32, np.int32, np.int32, np.int32, np.int32],
+        "scalar_conv2d",
+        "scalar_conv.o",
+        [
+            tile_in_ty,
+            tile_w_ty,
+            tile_out_ty,
+            np.int32,
+            np.int32,
+            np.int32,
+            np.int32,
+            np.int32,
+        ],
     )
 
     # Worker task: runs once on a compute tile

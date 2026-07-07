@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import pytest
+import torch
 
 from iron.operators.scalar_conv2d.op import ScalarConv2D
 from iron.operators.scalar_conv2d.reference import generate_golden_reference
@@ -46,9 +47,16 @@ def test_conv2d(h, w, k_h, k_w, padding, aie_context):
         context=aie_context,
     )
 
+    # Zero-pad weights to the DMA-aligned buffer size the design expects
+    # (see ScalarConv2D.weight_size); the kernel never reads the padding.
+    weights = golden_ref["Kernel"].reshape(-1)
+    pad = operator.weight_size - weights.numel()
+    if pad:
+        weights = torch.nn.functional.pad(weights, (0, pad))
+
     input_buffers = {
         "input": golden_ref["Input"],
-        "weights": golden_ref["Kernel"],
+        "weights": weights,
     }
     output_buffers = {"output": golden_ref["Output"]}
 

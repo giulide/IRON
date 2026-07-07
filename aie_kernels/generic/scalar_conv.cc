@@ -46,14 +46,14 @@ void scalar_conv2d(bfloat16 *restrict input, bfloat16 *restrict weights,
 
                     // Zero-padding: skip out-of-bounds positions
                     if (ih >= 0 && ih < H && iw >= 0 && iw < W) {
-                        float inp = aie::to_float<bfloat16>(input[ih * W + iw], 0);
-                        float wgt = aie::to_float<bfloat16>(weights[kh * kW + kw], 0);
+                        float inp = static_cast<float>(input[ih * W + iw]);
+                        float wgt = static_cast<float>(weights[kh * kW + kw]);
                         sum += inp * wgt;
                     }
                 }
             }
 
-            output[oh * W_out + ow] = aie::to_bfloat16(sum, 0);
+            output[oh * W_out + ow] = static_cast<bfloat16>(sum);
         }
     }
 
