@@ -49,12 +49,15 @@ class Conv2DDW(MLIROperator):
         super().__init__(context=self.context)
 
     def get_arg_spec(self) -> list[AIERuntimeArgSpec]:
-        H_out = self.h + 2 * self.padding - self.k_h + 1
-        W_out = self.w + 2 * self.padding - self.k_w + 1
+        # Input is externally padded: C * Hp * Wp
+        Hp = self.h + 2 * self.padding
+        Wp = self.w + 2 * self.padding
+        Ho = Hp - self.k_h + 1
+        Wo = Wp - self.k_w + 1
         return [
-            AIERuntimeArgSpec("in", (self.c * self.h * self.w,)),          # input
-            AIERuntimeArgSpec("in", (self.c * self.k_h * self.k_w,)),      # weights
-            AIERuntimeArgSpec("out", (self.c * H_out * W_out,)),           # output
+            AIERuntimeArgSpec("in", (self.c * Hp * Wp,)),          # padded input
+            AIERuntimeArgSpec("in", (self.c * self.k_h * self.k_w,)),  # weights
+            AIERuntimeArgSpec("out", (self.c * Ho * Wo,)),         # output
         ]
 
     def _mlir_callback_args(self) -> list[Any]:
@@ -80,7 +83,7 @@ class Conv2DDW(MLIROperator):
                     SourceArtifact(
                         self.context.base_dir
                         / "aie_kernels"
-                        / "generic"
+                        / "aie2p"
                         / "depthwise_conv.cc"
                     )
                 ],
