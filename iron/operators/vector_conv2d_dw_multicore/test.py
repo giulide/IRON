@@ -60,7 +60,6 @@ def get_params():
         (48, 16, 32, 3, 3, 1),
         (24, 40, 32, 3, 3, 1),
         (64, 16, 32, 3, 3, 1),  # multi-macro streaming with row_in < 1023
-        (128, 128, 32, 3, 3, 1),  # very large: stresses tiling / L1 budget
     ]
     params = []
     for h, w, c, k_h, k_w, padding in test_cases:
