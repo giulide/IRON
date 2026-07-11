@@ -81,7 +81,7 @@ class VectorConv2DDWMC(MLIROperator):
         cp = g["c_padded"]
         return [
             AIERuntimeArgSpec("in", (g["hp_padded"] * g["wp_padded"] * cp,)),  # padded input
-            AIERuntimeArgSpec("in", (self.k_h * self.k_w * cp,)),              # weights
+            AIERuntimeArgSpec("in", (self.k_h * self.k_w * cp,)),  # weights (broadcast natively)
             AIERuntimeArgSpec("out", (g["H_out_pad"] * g["W_out_pad"] * cp,)),  # padded output
         ]
 

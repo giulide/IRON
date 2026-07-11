@@ -30,6 +30,24 @@ VEC = 32
 # the output + weight buffers).
 MAX_TILE_ELEMENTS = 6144
 
+# Hardware limit on the innermost DMA transfer dimension (elements), found
+# empirically this session: a per-slice row (w_in_tile * c_padded, or
+# wp_padded * c_padded for the num_w_sub==1 case) of exactly 2048 fails
+# ('aie.dma_bd' op Size 0 exceeds the [0:1023] range -- almost certainly an
+# 11-bit unsigned field silently wrapping to 0), 2047 and below work.
+MAX_ROW_IN = 2047
+
+# Max number of W-slices (each a separate pair of Shim<->MemTile transfers,
+# looped in Python -- see design.py) that runs correctly. IMPORTANT: this is
+# a RUNTIME limit, not just a compile-time one -- 7 slices (15 total
+# transfers incl. the weight fill) COMPILES fine but hangs
+# (ERT_CMD_STATE_TIMEOUT) at execution; 8 slices (17 transfers) fails to
+# compile at all ('aie.dma_bd' op Free called on BD chain with unassigned
+# IDs). Only 6 slices (13 transfers) was verified to both compile AND run
+# with a numerically correct result. Kept as a named constant so the guard
+# in design.py explains itself.
+MAX_W_SLICES = 6
+
 
 def compute_tiling(h, w, c, k_h, k_w, padding, num_cores):
     """Return the padded 2-D tiling geometry (elements / rows / cols) as a dict."""
@@ -40,21 +58,26 @@ def compute_tiling(h, w, c, k_h, k_w, padding, num_cores):
     H_out = h + 2 * padding - k_h + 1    # true output height
 
     # --- Width tiling ---
-    # Full width only when a k_h-row full-width band already fits L1 (narrow
-    # image: tiling W would add halo for nothing). Otherwise use a SQUARE-ish
-    # tile: don't maximise W (that squeezes H to 1 row and makes num_h_sub blow
-    # past the DMA's 64-iteration-per-dimension limit) — balance both axes so
-    # each sub-tile count stays small while halo overhead is minimised.
-    max_w_in = max(k_w, MAX_TILE_ELEMENTS // (k_h * c_padded))
-    if max_w_in >= wp:
+    # Full width only when a k_h-row full-width band already fits L1 AND its
+    # row (wp*c_padded) is under the hardware's innermost-dimension limit
+    # (narrow image: tiling W would only add halo for nothing anyway).
+    # Otherwise, tile W as WIDE as safely possible -- bounded by the L1 budget
+    # (with h_in_tile at its k_h minimum) AND the MAX_ROW_IN hardware limit --
+    # rather than a square-ish heuristic: each W-slice reuses the full
+    # round-robin-H trick internally (see design.py), so wider slices mean
+    # fewer separate Shim transfers (the actual scarce resource -- see
+    # MAX_W_SLICES), not less L1 headroom.
+    max_w_in_l1 = MAX_TILE_ELEMENTS // (k_h * c_padded)
+    max_w_in_hw = MAX_ROW_IN // c_padded
+    max_w_in = max(k_w, min(max_w_in_l1, max_w_in_hw))
+    if max_w_in >= wp and wp * c_padded <= MAX_ROW_IN:
         w_in_tile = wp
         w_out_tile = W_out
         num_w_sub = 1
     else:
-        side = max(k_w, math.isqrt(MAX_TILE_ELEMENTS // c_padded))  # ~sqrt(area) side
-        max_w_out = max(1, side - (k_w - 1))
+        max_w_out = max(1, max_w_in - (k_w - 1))
         num_w_sub = math.ceil(W_out / max_w_out)
-        w_out_tile = math.ceil(W_out / num_w_sub)
+        w_out_tile = math.ceil(W_out / num_w_sub)  # rebalance evenly
         w_in_tile = w_out_tile + (k_w - 1)
     W_out_pad = num_w_sub * w_out_tile             # output cols, padded to whole tiles
     wp_padded = W_out_pad + (k_w - 1)              # padded input cols the tiles read
@@ -75,6 +98,21 @@ def compute_tiling(h, w, c, k_h, k_w, padding, num_cores):
     row_in = wp_padded * c_padded                  # elements per padded input row
     row_out = W_out_pad * c_padded                 # elements per padded output row
 
+    # Round-robin tile assignment (used only when num_w_sub == 1, i.e. no
+    # W-tiling): tiles are numbered 0..num_tiles_total_padded-1 in natural
+    # top-to-bottom image order and handed out core = tile_index % num_cores.
+    # "Which core" is then a pure function of position within one linear
+    # sweep, so a SINGLE hardware-repeating DMA dimension (stride =
+    # h_out_tile*row_in) covers every tile of every core at once --
+    # consolidating all cores onto one Shim channel (via split()/join()
+    # through the MemTile) with NO limit on image height. This does NOT
+    # extend to num_w_sub > 1: seeARCHITECTURE.md / design.py module
+    # docstring for why (2 independent spatial axes + core selection exceed
+    # the 3 usable descriptor dimensions once the shim_dma_single_bd_task
+    # repeat_count bug's leading dummy dimension is accounted for).
+    num_waves = num_h_sub_per_core          # tiles each core handles
+    num_tiles_total_padded = num_cores * num_waves
+
     return {
         "c_padded": c_padded,
         "wp_padded": wp_padded,
@@ -92,4 +130,6 @@ def compute_tiling(h, w, c, k_h, k_w, padding, num_cores):
         "band_rows": band_rows,
         "H_out_pad": H_out_pad,
         "hp_padded": hp_padded,
+        "num_waves": num_waves,
+        "num_tiles_total_padded": num_tiles_total_padded,
     }

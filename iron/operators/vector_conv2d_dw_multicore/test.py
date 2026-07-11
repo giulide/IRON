@@ -7,6 +7,7 @@ import torch
 
 from iron.operators.vector_conv2d_dw_multicore.op import VectorConv2DDWMC
 from iron.operators.vector_conv2d_dw_multicore.reference import generate_golden_reference
+from iron.operators.vector_conv2d_dw_multicore.tiling import MAX_W_SLICES
 from iron.common.test_utils import run_test
 
 
@@ -35,8 +36,8 @@ def depthwise_valid(x_padded, weight_hwc):
     """Depthwise conv of the already-padded input with padding=0 (HWC in/out).
 
     Matches the multi-core kernel exactly (it is a pure conv over the pre-padded
-    input), so the reference covers the padded H_out_pad x W_out output including
-    the phantom rows; the valid H_out x W_out region equals the true padded conv.
+    input), so the reference covers the padded H_out_pad x W_out_pad output
+    including the phantom rows/cols.
     """
     cp = x_padded.shape[-1]
     x_nchw = x_padded.permute(2, 0, 1).unsqueeze(0).contiguous()
@@ -46,11 +47,15 @@ def depthwise_valid(x_padded, weight_hwc):
 
 
 def get_params():
-    # (h, w, c, k_h, k_w, padding) — c=32, spatial 15x15..50x50 with variable
-    # widths. These exceed the single-column L1 budget: the multi-core operator
-    # groups the 4 cores' L1 strips into a MemTile macro-tile that ping-pongs
-    # with DRAM, so tall/wide images stream through without exhausting L1 or the
-    # DMA descriptor pool.
+    # (h, w, c, k_h, k_w, padding) — c=32/64/96. Narrow/medium cases need no
+    # W-tiling (num_w_sub == 1): the round-robin + MemTile consolidation (see
+    # design.py) applies directly, using only the column's native Shim budget
+    # (1 input + 1 weight-broadcast + 1 output channel), with NO limit on
+    # image height (h=1000 / h=200+w=61 below exercise this directly). Larger
+    # cases (128x128 and up) need W-tiling too (num_w_sub > 1): each W-slice
+    # reuses the same round-robin-H trick, issued as its own Shim<->MemTile
+    # transfer pair in a Python loop -- safe up to MAX_W_SLICES slices (see
+    # tiling.py / design.py module docstring for the empirically-found bound).
     test_cases = [
         (8, 8, 32, 3, 3, 1),
         (8, 16, 32, 3, 3, 1),
@@ -62,17 +67,20 @@ def get_params():
         (16, 48, 32, 3, 3, 1),
         (48, 16, 32, 3, 3, 1),
         (24, 40, 32, 3, 3, 1),
-        (64, 16, 32, 3, 3, 1),   # tall: many H sub-tiles streamed per core
-        (128, 128, 32, 3, 3, 1),  # very large: needs 2-D (H+W) tiling
-        (160, 160, 32, 3, 3, 1),  # stress
-        (256, 256, 32, 3, 3, 1),  # stress
-        (320, 320, 32, 3, 3, 1),  # stress: hundreds of blocks per core
+        (64, 16, 32, 3, 3, 1),
         (16, 16, 64, 3, 3, 1),   # c > 32: kernel loops 2 channel-groups internally
         (16, 16, 96, 3, 3, 1),   # c > 32: kernel loops 3 channel-groups internally
-        (32, 32, 64, 3, 3, 1),
-        (32, 32, 96, 3, 3, 1),
-        (48, 48, 96, 3, 3, 1),
-        (160, 160, 96, 3, 3, 1),
+        (1000, 8, 32, 3, 3, 1),  # very tall: proves no height limit (round-robin core assignment)
+        (61, 61, 32, 3, 3, 1),   # largest safe c=32 square with num_w_sub==1 (row_in=2016)
+        (200, 61, 32, 3, 3, 1),  # worst case: w at its max (h_out_tile=1) AND tall -- proves height is
+                                 # still unbounded even when every H row is its own tile (num_tiles=200)
+        (64, 100, 32, 3, 3, 1),  # smallest W-tiled case: num_w_sub=2, exercises halo between W-slices
+        (128, 128, 32, 3, 3, 1),  # W-tiled: num_w_sub=3
+        (160, 160, 32, 3, 3, 1),  # W-tiled: num_w_sub=3
+        (256, 256, 32, 3, 3, 1),  # W-tiled: num_w_sub=5
+        (320, 320, 32, 3, 3, 1),  # W-tiled: num_w_sub=6, at MAX_W_SLICES
+        (32, 32, 64, 3, 3, 1),   # W-tiled at higher c: num_w_sub=2
+        (48, 48, 96, 3, 3, 1),   # W-tiled at higher c: num_w_sub=3
     ]
     params = []
     for h, w, c, k_h, k_w, padding in test_cases:
@@ -127,3 +135,28 @@ def test_conv2d_dw_multicore(h, w, c, k_h, k_w, padding, aie_context):
     print(f"Effective Bandwidth: {bandwidth_gbps:.6e} GB/s\n")
 
     assert not errors, f"Test failed with errors: {errors}"
+
+
+@pytest.mark.supported_devices("npu2")
+@pytest.mark.parametrize(
+    "w,expected_num_w_sub,should_pass",
+    [
+        (366, MAX_W_SLICES, True),        # c=32: num_w_sub == MAX_W_SLICES (6), must compile
+        (367, MAX_W_SLICES + 1, False),   # c=32: num_w_sub == MAX_W_SLICES+1 (7), must raise
+    ],
+)
+def test_conv2d_dw_multicore_max_w_slices_guard(w, expected_num_w_sub, should_pass, aie_context):
+    """MAX_W_SLICES (see tiling.py) is the empirically-found number of W-slice
+    Shim<->MemTile transfer pairs that runs correctly end-to-end; one more
+    slice compiles but HANGS at execution (not just a compile-time issue --
+    see design.py module docstring), so it must raise a clear error instead.
+    """
+    operator = VectorConv2DDWMC(
+        h=16, w=w, c=32, k_h=3, k_w=3, padding=1, num_cores=4, context=aie_context,
+    )
+    assert operator.tiling["num_w_sub"] == expected_num_w_sub
+    if should_pass:
+        operator.compile()  # must not raise
+    else:
+        with pytest.raises(ValueError, match="W-slices"):
+            operator.compile()
