@@ -59,10 +59,13 @@ def test_conv2d_dw_scalar(c, h, w, k_h, k_w, padding, aie_context):
     output_buffers = {"output": golden_ref["Output"]}
 
     errors, latency_us, bandwidth_gbps = run_test(
-        operator, input_buffers, output_buffers, rel_tol=0.04, abs_tol=1e-6
+        operator, input_buffers, output_buffers, rel_tol=0.04, abs_tol=1e-6,
+        warmup_iters=10, timed_iters=50,
     )
 
+    ns_per_elem = latency_us * 1e3 / (h * w * c)
     print(f"\nLatency (us): {latency_us:.1f}")
+    print(f"BENCH {h}x{w}x{c}: latency_us={latency_us:.2f} ns_per_elem={ns_per_elem:.4f}")
     print(f"Effective Bandwidth: {bandwidth_gbps:.6e} GB/s\n")
 
     assert not errors, f"Test failed with errors: {errors}"

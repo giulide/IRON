@@ -52,6 +52,9 @@ def get_params():
     # with DRAM, so tall/wide images stream through without exhausting L1 or the
     # DMA descriptor pool.
     test_cases = [
+        (8, 8, 32, 3, 3, 1),
+        (8, 16, 32, 3, 3, 1),
+        (16, 8, 32, 3, 3, 1),
         (16, 16, 32, 3, 3, 1),
         (24, 24, 32, 3, 3, 1),
         (32, 32, 32, 3, 3, 1),
@@ -59,7 +62,17 @@ def get_params():
         (16, 48, 32, 3, 3, 1),
         (48, 16, 32, 3, 3, 1),
         (24, 40, 32, 3, 3, 1),
-        (64, 16, 32, 3, 3, 1),  # multi-macro streaming with row_in < 1023
+        (64, 16, 32, 3, 3, 1),   # tall: many H sub-tiles streamed per core
+        (128, 128, 32, 3, 3, 1),  # very large: needs 2-D (H+W) tiling
+        (160, 160, 32, 3, 3, 1),  # stress
+        (256, 256, 32, 3, 3, 1),  # stress
+        (320, 320, 32, 3, 3, 1),  # stress: hundreds of blocks per core
+        (16, 16, 64, 3, 3, 1),   # c > 32: kernel loops 2 channel-groups internally
+        (16, 16, 96, 3, 3, 1),   # c > 32: kernel loops 3 channel-groups internally
+        (32, 32, 64, 3, 3, 1),
+        (32, 32, 96, 3, 3, 1),
+        (48, 48, 96, 3, 3, 1),
+        (160, 160, 96, 3, 3, 1),
     ]
     params = []
     for h, w, c, k_h, k_w, padding in test_cases:
@@ -91,11 +104,11 @@ def test_conv2d_dw_multicore(h, w, c, k_h, k_w, padding, aie_context):
     # Host-side padding: channel-pad, then place inside the padded input buffer.
     x_cpadded = pad_channels(golden_ref["Input"], cp)          # (h, w, cp)
     weight_cpadded = pad_channels(golden_ref["Kernel"], cp)    # (k_h, k_w, cp)
-    x_padded = build_padded_input(x_cpadded, g["hp_padded"], g["wp"], cp, padding)
+    x_padded = build_padded_input(x_cpadded, g["hp_padded"], g["wp_padded"], cp, padding)
 
     # Reference over the padded input (matches the kernel's pure conv, incl. the
-    # phantom rows padded up to a whole number of macro-tiles).
-    expected = depthwise_valid(x_padded, weight_cpadded)       # (H_out_pad, W_out, cp)
+    # phantom rows/cols padded up to whole sub-tiles).
+    expected = depthwise_valid(x_padded, weight_cpadded)       # (H_out_pad, W_out_pad, cp)
 
     input_buffers = {
         "input": x_padded,
@@ -104,10 +117,13 @@ def test_conv2d_dw_multicore(h, w, c, k_h, k_w, padding, aie_context):
     output_buffers = {"output": expected}
 
     errors, latency_us, bandwidth_gbps = run_test(
-        operator, input_buffers, output_buffers, rel_tol=0.04, abs_tol=1e-6
+        operator, input_buffers, output_buffers, rel_tol=0.04, abs_tol=1e-6,
+        warmup_iters=10, timed_iters=50,
     )
 
+    ns_per_elem = latency_us * 1e3 / (h * w * c)
     print(f"\nLatency (us): {latency_us:.1f}")
+    print(f"BENCH {h}x{w}x{c}: latency_us={latency_us:.2f} ns_per_elem={ns_per_elem:.4f}")
     print(f"Effective Bandwidth: {bandwidth_gbps:.6e} GB/s\n")
 
     assert not errors, f"Test failed with errors: {errors}"

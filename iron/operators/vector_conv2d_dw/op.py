@@ -68,15 +68,9 @@ class VectorConv2DDW(MLIROperator):
         W_out = self.w + 2 * self.padding - self.k_w + 1
         cp = self.channels_padded
         return [
-            AIERuntimeArgSpec(
-                "in", (self.h * self.w * cp,)
-            ),  # input (HWC, channel-padded)
-            AIERuntimeArgSpec(
-                "in", (self.k_h * self.k_w * cp,)
-            ),  # weights (channel-padded)
-            AIERuntimeArgSpec(
-                "out", (H_out * W_out * cp,)
-            ),  # output (HWC, channel-padded)
+            AIERuntimeArgSpec("in", (self.h * self.w * cp,)),  # input (HWC, channel-padded)
+            AIERuntimeArgSpec("in", (self.k_h * self.k_w * cp,)),  # weights (HWC, channel-padded)
+            AIERuntimeArgSpec("out", (H_out * W_out * cp,)),  # output (HWC, channel-padded)
         ]
 
     def _mlir_callback_args(self) -> list[Any]:

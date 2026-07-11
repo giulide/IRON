@@ -75,14 +75,14 @@ class VectorConv2DDWMC(MLIROperator):
 
     def get_arg_spec(self) -> list[AIERuntimeArgSpec]:
         # Buffers are in *padded* space: the host pre-pads the input (H and W)
-        # and pads the output rows up to a whole number of macro-tiles. The
-        # kernel then needs no boundary handling and every DMA is regular.
+        # and pads the output rows/cols up to whole sub-tiles. The kernel then
+        # needs no boundary handling and every DMA is regular.
         g = self.tiling
         cp = g["c_padded"]
         return [
-            AIERuntimeArgSpec("in", (g["hp_padded"] * g["wp"] * cp,)),  # padded input
-            AIERuntimeArgSpec("in", (self.k_h * self.k_w * cp,)),       # weights
-            AIERuntimeArgSpec("out", (g["H_out_pad"] * g["W_out"] * cp,)),  # padded output
+            AIERuntimeArgSpec("in", (g["hp_padded"] * g["wp_padded"] * cp,)),  # padded input
+            AIERuntimeArgSpec("in", (self.k_h * self.k_w * cp,)),              # weights
+            AIERuntimeArgSpec("out", (g["H_out_pad"] * g["W_out_pad"] * cp,)),  # padded output
         ]
 
     def _mlir_callback_args(self) -> list[Any]:
