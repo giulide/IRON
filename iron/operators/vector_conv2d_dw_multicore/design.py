@@ -104,15 +104,21 @@ from aie.helpers.taplib.tap import TensorAccessPattern
 from iron.operators.vector_conv2d_dw_multicore.tiling import compute_tiling, MAX_W_SLICES
 
 
-def conv2d_dw_multicore(dev, h, w, c, k_h, k_w, padding, num_cores):
-    g = compute_tiling(h, w, c, k_h, k_w, padding, num_cores)
+def _check_hw_limits(g, col, w, c):
+    """Raise a clear ValueError if column `col`'s tiling geometry `g`
+    violates a known hardware limit (see design.py module docstring).
 
+    Must be called BEFORE `rt.sequence()`/`rt.task_group()` are opened: if a
+    ValueError is raised from inside an open task group, the `with
+    rt.sequence(...)` block's own cleanup masks it with an unrelated
+    "Failed to close task groups" error instead of this message.
+    """
     if g["num_w_sub"] > MAX_W_SLICES:
         raise ValueError(
-            f"conv2d_dw_multicore: w={w} (c={c}) needs {g['num_w_sub']} "
-            f"W-slices, more than the Shim buffer-descriptor pool can "
-            f"sustain (MAX_W_SLICES={MAX_W_SLICES}, see design.py module "
-            f"docstring). Reduce w or c."
+            f"conv2d_dw_multicore: col={col}: w={w} (c={c}) needs "
+            f"{g['num_w_sub']} W-slices, more than the Shim buffer-"
+            f"descriptor pool can sustain (MAX_W_SLICES={MAX_W_SLICES}, "
+            f"see design.py module docstring). Reduce w or c."
         )
 
     # The innermost DMA size (per W-slice: w_in_tile * c_padded; this equals
@@ -122,12 +128,70 @@ def conv2d_dw_multicore(dev, h, w, c, k_h, k_w, padding, num_cores):
     row_in_tile = g["w_in_tile"] * g["c_padded"]
     if row_in_tile > 2047:
         raise ValueError(
-            f"conv2d_dw_multicore: w={w} (c={c}) gives an innermost DMA "
-            f"size of {row_in_tile} (= w_in_tile {g['w_in_tile']} * "
-            f"c_padded {g['c_padded']}) > 2047, the hardware's "
-            f"innermost-DMA-dimension limit (see design.py module "
-            f"docstring). Reduce w or c."
+            f"conv2d_dw_multicore: col={col}: w={w} (c={c}) gives an "
+            f"innermost DMA size of {row_in_tile} (= w_in_tile "
+            f"{g['w_in_tile']} * c_padded {g['c_padded']}) > 2047, the "
+            f"hardware's innermost-DMA-dimension limit (see design.py "
+            f"module docstring). Reduce w or c."
         )
+
+
+def _make_conv_kernel(g, k_h, k_w):
+    """Construct the ONE `Kernel` object to be shared by every column's
+    Workers -- see `_build_column`'s docstring for why it must not be
+    constructed per column."""
+    c_padded = g["c_padded"]
+    tile_in_elems = g["h_in_tile"] * g["w_in_tile"] * c_padded
+    tile_out_elems = g["h_out_tile"] * g["w_out_tile"] * c_padded
+    w_elems = k_h * k_w * c_padded
+    tile_in_ty = np.ndarray[(tile_in_elems,), np.dtype[bfloat16]]
+    tile_w_ty = np.ndarray[(w_elems,), np.dtype[bfloat16]]
+    tile_out_ty = np.ndarray[(tile_out_elems,), np.dtype[bfloat16]]
+    return Kernel(
+        "vector_conv2d_dw_mc",
+        "vector_conv2d_dw_mc.o",
+        [tile_in_ty, tile_w_ty, tile_out_ty,
+         np.int32, np.int32, np.int32, np.int32, np.int32],  # W, C, kH, kW, H_out_tile
+    )
+
+
+def _build_column(rt, tg, col, h, w, c, k_h, k_w, padding, num_cores, conv_fn,
+                   in_tensor, w_tensor, out_tensor, num_columns=1,
+                   in_base_offset=0, w_base_offset=0, out_base_offset=0):
+    """Add one column's worth of ObjectFifos/Workers/DMA fill-drain ops to an
+    already-open `rt`/`tg`.
+
+    Every tile is EXPLICITLY pinned to column `col` -- MemTile: Tile(col, 1),
+    Workers: Tile(col, 2..5), Shim fill/drain: Tile(col, 0). This is required
+    (not just a nicety) once more than one column shares a Program:
+    `SequentialPlacer` places Workers via a flat column-major sequential
+    counter that ignores ObjectFifo connectivity entirely, so unpinned
+    Workers would not reliably land on the same column as this group's
+    MemTile. Separately, its "common column" heuristic for unpinned Shim
+    endpoints only looks at an ObjectFifo's DIRECT endpoints -- for the
+    MemTile-routed fifos here (split()/join()) that never includes the
+    downstream compute tiles, so it would silently resolve every column's
+    Shim traffic toward column 0 and spill from there -- exactly the
+    cross-column Shim-borrowing this design must avoid (see module
+    docstring). Hence Shim placement is pinned too, not left to inference.
+
+    `num_columns`/`*_base_offset` let multiple columns share one flat DRAM
+    tensor: `num_columns` independently-padded HWC blocks stacked
+    back-to-back (NOT a literal interleaved [h,w,c*num_columns] tensor).
+    Defaults (num_columns=1, offsets=0) reproduce the single-column layout.
+
+    `conv_fn` must be ONE `Kernel(...)` object constructed once by the
+    caller and passed to every `_build_column` call sharing a Program --
+    constructing a fresh `Kernel` per column (even with identical name/
+    signature) makes MLIR verification fail with "redefinition of symbol
+    named 'vector_conv2d_dw_mc'", since each `Kernel()` call emits its own
+    symbol declaration.
+    """
+    # Callers MUST have already validated via _check_hw_limits() before
+    # opening rt.sequence()/rt.task_group() -- see that function's docstring
+    # for why a raise from inside an open task group produces a confusing,
+    # masked error instead of the clear message below.
+    g = compute_tiling(h, w, c, k_h, k_w, padding, num_cores)
 
     c_padded = g["c_padded"]
     wp_padded = g["wp_padded"]
@@ -147,48 +211,38 @@ def conv2d_dw_multicore(dev, h, w, c, k_h, k_w, padding, num_cores):
     tile_out_elems = h_out_tile * w_out_tile * c_padded
     w_elems = k_h * k_w * c_padded
 
-    # Host tensor types. Weights: one copy, broadcast to every core natively
-    # (see below) -- no host-side duplication needed.
-    tensor_in_ty = np.ndarray[(hp_padded * wp_padded * c_padded,), np.dtype[bfloat16]]
-    tensor_w_ty = np.ndarray[(w_elems,), np.dtype[bfloat16]]
-    tensor_out_ty = np.ndarray[(H_out_pad * W_out_pad * c_padded,), np.dtype[bfloat16]]
+    per_col_in_elems = hp_padded * wp_padded * c_padded
+    per_col_out_elems = H_out_pad * W_out_pad * c_padded
 
     # L1 tile buffers (the fundamental building block: one H x one W-slice tile).
     tile_in_ty = np.ndarray[(tile_in_elems,), np.dtype[bfloat16]]
     tile_w_ty = np.ndarray[(w_elems,), np.dtype[bfloat16]]
     tile_out_ty = np.ndarray[(tile_out_elems,), np.dtype[bfloat16]]
 
-    conv_fn = Kernel(
-        "vector_conv2d_dw_mc",
-        "vector_conv2d_dw_mc.o",
-        [tile_in_ty, tile_w_ty, tile_out_ty,
-         np.int32, np.int32, np.int32, np.int32, np.int32],  # W, C, kH, kW, H_out_tile
-    )
-
     # --- Input: one Shim channel -> MemTile macro (one wave = num_cores
     # tiles) -> split() fan-out to the num_cores L1 tiles, fixed offsets.
     # Reused across every W-slice (only the runtime fill's DRAM offset moves,
     # see below) and across every H-wave within a slice. ---
     macro_in_ty = np.ndarray[(num_cores * tile_in_elems,), np.dtype[bfloat16]]
-    of_macro_in = ObjectFifo(macro_in_ty, name="macro_in", depth=2)
+    of_macro_in = ObjectFifo(macro_in_ty, name=f"macro_in_c{col}", depth=2)
     sub_ins = of_macro_in.cons().split(
         offsets=[i * tile_in_elems for i in range(num_cores)],
         obj_types=[tile_in_ty] * num_cores,
         depths=[2] * num_cores,
-        names=[f"l1_in{i}" for i in range(num_cores)],
-        placement=Tile(0, 1),
+        names=[f"l1_in_c{col}_{i}" for i in range(num_cores)],
+        placement=Tile(col, 1),
     )
 
     # --- Output: num_cores L1 tiles -> join() gather (fixed offsets) ->
     # MemTile macro -> one Shim channel. Reused the same way. ---
     macro_out_ty = np.ndarray[(num_cores * tile_out_elems,), np.dtype[bfloat16]]
-    of_macro_out = ObjectFifo(macro_out_ty, name="macro_out", depth=2)
+    of_macro_out = ObjectFifo(macro_out_ty, name=f"macro_out_c{col}", depth=2)
     sub_outs = of_macro_out.prod().join(
         offsets=[i * tile_out_elems for i in range(num_cores)],
         obj_types=[tile_out_ty] * num_cores,
         depths=[2] * num_cores,
-        names=[f"l1_out{i}" for i in range(num_cores)],
-        placement=Tile(0, 1),
+        names=[f"l1_out_c{col}_{i}" for i in range(num_cores)],
+        placement=Tile(col, 1),
     )
 
     # Weights: ONE Shim channel, broadcast to all num_cores cores directly
@@ -196,7 +250,7 @@ def conv2d_dw_multicore(dev, h, w, c, k_h, k_w, padding, num_cores):
     # physical destination for the same single incoming stream; no MemTile
     # hop, no host-side data duplication needed). Safe because it is
     # single-shot (filled once, reused by every wave AND every W-slice).
-    of_w = ObjectFifo(tile_w_ty, name="w", depth=1)
+    of_w = ObjectFifo(tile_w_ty, name=f"w_c{col}", depth=1)
     sub_ws = [of_w.cons() for _ in range(num_cores)]
 
     num_waves = num_tiles // num_cores       # H-tiles processed by each core, per W-slice
@@ -214,43 +268,73 @@ def conv2d_dw_multicore(dev, h, w, c, k_h, k_w, padding, num_cores):
             of_w_.release(1)
         return body
 
+    # Explicit per-core placement -- see function docstring for why this
+    # can't be left to the auto-placer once more than one column is in play.
     workers = [
         Worker(
             make_body(),
             [sub_ins[i].cons(), sub_ws[i], sub_outs[i].prod(), conv_fn],
+            placement=Tile(col, 2 + i),
         )
         for i in range(num_cores)
     ]
 
+    rt.start(*workers)
+
+    shim = Tile(col, 0)
+
+    # Weights: single fill, broadcast to every core (see above). Sliced out
+    # of the (possibly multi-column) flat weight tensor by an explicit TAP
+    # rather than the no-tap default (which would fill with the WHOLE tensor).
+    w_tap = TensorAccessPattern(
+        (1, num_columns * w_elems),
+        offset=w_base_offset,
+        sizes=[1, 1, 1, w_elems],
+        strides=[0, 0, 0, 1],
+    )
+    rt.fill(of_w.prod(), w_tensor, tap=w_tap, task_group=tg, placement=shim)
+
+    # One pair of transfers per W-slice (Python loop -- see module
+    # docstring for why W can't also be a DMA dimension). Each covers
+    # every H-tile of every core within that slice via a SINGLE hardware-
+    # repeating dimension (the round-robin trick), exactly like the
+    # num_w_sub==1 case. Leading dim (size 1) neutralises the
+    # repeat_count bug (see module docstring).
+    for ws in range(num_w_sub):
+        in_tap = TensorAccessPattern(
+            (1, num_columns * per_col_in_elems),
+            offset=in_base_offset + ws * w_out_tile * c_padded,
+            sizes=[1, num_tiles, h_in_tile, w_in_tile * c_padded],
+            strides=[0, h_out_tile * row_in, row_in, 1],
+        )
+        out_tap = TensorAccessPattern(
+            (1, num_columns * per_col_out_elems),
+            offset=out_base_offset + ws * w_out_tile * c_padded,
+            sizes=[1, num_tiles, h_out_tile, w_out_tile * c_padded],
+            strides=[0, h_out_tile * row_out, row_out, 1],
+        )
+        rt.fill(of_macro_in.prod(), in_tensor, tap=in_tap, task_group=tg, placement=shim)
+        rt.drain(of_macro_out.cons(), out_tensor, tap=out_tap, task_group=tg, wait=True, placement=shim)
+
+
+def conv2d_dw_multicore(dev, h, w, c, k_h, k_w, padding, num_cores):
+    g = compute_tiling(h, w, c, k_h, k_w, padding, num_cores)
+    _check_hw_limits(g, 0, w, c)
+    c_padded = g["c_padded"]
+    w_elems = k_h * k_w * c_padded
+
+    # Host tensor types. Weights: one copy, broadcast to every core natively
+    # (see below) -- no host-side duplication needed.
+    tensor_in_ty = np.ndarray[(g["hp_padded"] * g["wp_padded"] * c_padded,), np.dtype[bfloat16]]
+    tensor_w_ty = np.ndarray[(w_elems,), np.dtype[bfloat16]]
+    tensor_out_ty = np.ndarray[(g["H_out_pad"] * g["W_out_pad"] * c_padded,), np.dtype[bfloat16]]
+
+    conv_fn = _make_conv_kernel(g, k_h, k_w)
+
     rt = Runtime()
     with rt.sequence(tensor_in_ty, tensor_w_ty, tensor_out_ty) as (A, B, Y):
-        rt.start(*workers)
         tg = rt.task_group()
-
-        # Weights: single fill, broadcast to every core (see above).
-        rt.fill(of_w.prod(), B, task_group=tg)
-
-        # One pair of transfers per W-slice (Python loop -- see module
-        # docstring for why W can't also be a DMA dimension). Each covers
-        # every H-tile of every core within that slice via a SINGLE hardware-
-        # repeating dimension (the round-robin trick), exactly like the
-        # num_w_sub==1 case. Leading dim (size 1) neutralises the
-        # repeat_count bug (see module docstring).
-        for ws in range(num_w_sub):
-            in_tap = TensorAccessPattern(
-                (1, hp_padded * wp_padded * c_padded),
-                offset=ws * w_out_tile * c_padded,
-                sizes=[1, num_tiles, h_in_tile, w_in_tile * c_padded],
-                strides=[0, h_out_tile * row_in, row_in, 1],
-            )
-            out_tap = TensorAccessPattern(
-                (1, H_out_pad * W_out_pad * c_padded),
-                offset=ws * w_out_tile * c_padded,
-                sizes=[1, num_tiles, h_out_tile, w_out_tile * c_padded],
-                strides=[0, h_out_tile * row_out, row_out, 1],
-            )
-            rt.fill(of_macro_in.prod(), A, tap=in_tap, task_group=tg)
-            rt.drain(of_macro_out.cons(), Y, tap=out_tap, task_group=tg, wait=True)
+        _build_column(rt, tg, 0, h, w, c, k_h, k_w, padding, num_cores, conv_fn, A, B, Y)
         rt.finish_task_group(tg)
 
     return Program(dev, rt).resolve_program(SequentialPlacer())
