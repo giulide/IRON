@@ -15,13 +15,17 @@ from iron.common import (
     DesignGenerator,
 )
 from iron.common.context import AIEContext
+from iron.operators.scalar_conv2d_dw.tiling import compute_tiling
 
 
 @dataclass
 class ScalarConv2DDW(MLIROperator):
-    """AIE-accelerated scalar depthwise 2D convolution (CHW layout, single column).
+    """AIE-accelerated scalar depthwise 2D convolution (CHW layout, single core).
 
-    Each channel has its own kH*kW filter (no channel mixing).
+    Each channel has its own kH*kW filter (no channel mixing). H-tiled (see
+    design.py/tiling.py module docstrings) to handle images past the single
+    shot L1 ceiling -- intended for use at c=1, where W-tiling is never
+    needed (see tiling.py).
     """
 
     c: int  # number of channels
@@ -57,13 +61,20 @@ class ScalarConv2DDW(MLIROperator):
         k_size = self.c * self.k_h * self.k_w
         return (k_size + 3) // 4 * 4
 
+    @property
+    def tiling(self) -> dict:
+        """Padded H-tiling geometry shared with design.py (see tiling.py)."""
+        return compute_tiling(self.h, self.w, self.c, self.k_h, self.k_w, self.padding)
+
     def get_arg_spec(self) -> list[AIERuntimeArgSpec]:
-        H_out = self.h + 2 * self.padding - self.k_h + 1
-        W_out = self.w + 2 * self.padding - self.k_w + 1
+        # Buffers are in *padded* space: the host pre-pads the input (H
+        # only -- see tiling.py) and pads the output rows up to whole
+        # sub-tiles. The kernel then needs no boundary handling.
+        g = self.tiling
         return [
-            AIERuntimeArgSpec("in", (self.c * self.h * self.w,)),  # input (CHW)
+            AIERuntimeArgSpec("in", (self.c * g["hp_padded"] * g["wp"],)),  # padded input (CHW)
             AIERuntimeArgSpec("in", (self.weight_size,)),  # weights (padded, per-channel)
-            AIERuntimeArgSpec("out", (self.c * H_out * W_out,)),  # output (CHW)
+            AIERuntimeArgSpec("out", (self.c * g["H_out_pad"] * g["W_out"],)),  # padded output (CHW)
         ]
 
     def _mlir_callback_args(self) -> list[Any]:
