@@ -11,8 +11,8 @@ for the smaller channel counts, shrinking as channel count grows, down to
 78×78 at 1024 channels). Kernel 3×3, padding 1. Same grid used throughout
 `PERFORMANCE.md`.
 
-This version covers the **scalar** and **vectorized** results;
-multi-column follows next, on the same grid.
+This version covers all three NPU implementations plus a comparison
+against a single CPU core.
 
 ## 1. Scalar kernel (baseline, no parallelism)
 
@@ -83,6 +83,21 @@ exactly as in `PERFORMANCE.md`.
 | 768  | 0.10 | 0.49 | 0.74 | 1.55 | —    | —    |
 | 1024 | 0.11 | 0.68 | 0.94 | —    | —    | —    |
 
+**Why growth isn't clean past 256 channels**: up to 256 total channels,
+every step (32→64→...→256) adds a genuinely new, fully parallel column (32
+channels/column, up to 8 columns). At 512/768/1024 channels all 8 columns
+are already in use, so the extra channels can only be stacked as more
+serial work *within* each column (64, then 96, then 128 channels/column) —
+no longer new parallelism. That also shrinks the per-column L1 budget,
+forcing the width-tiling into more, smaller slices (see "Max processable
+image width vs. channels/column" in `PERFORMANCE.md`), which adds tiling
+overhead on top of the extra compute. So multi-column's own time grows
+slightly *faster* than the channel count past this point — which is why,
+in the speedup tables below, the multi-column advantage over scalar/CPU
+sometimes dips slightly (e.g. scalar-comparison at 114×114: 512ch is
+1,515.8×, 768ch is only 1,409.8×) even though the NPU keeps winning in
+absolute terms.
+
 ## 4. Speedups
 
 Same grid, each cell computed from the execution times above.
@@ -98,6 +113,19 @@ Same grid, each cell computed from the execution times above.
 | 512  | 66.5×  | 108.5× | 95.4× | 59.0× | 51.2× | —     |
 | 768  | 88.7×  | 113.2× | 97.3× | 62.0× | —     | —     |
 | 1024 | 100.7× | 112.9× | 93.9× | —     | —     | —     |
+
+**Why this can exceed 32×**: the vector unit is 32× wider than scalar (32
+channels/cycle vs. 1), so 32× is the raw compute ceiling — yet several
+cells above go well past it. That's a side effect of how the scalar number
+is built (Section 1): it multiplies *one* single-channel dispatch's time
+by the channel count, which effectively counts that dispatch's fixed
+launch overhead once per channel, while the vector number is a single real
+dispatch handling all those channels together, paying that fixed cost only
+once. This inflates the ratio most at small images, where fixed overhead
+is a bigger share of the total (up to 113× at 1024ch/64×64). At the
+largest image (366×366), where overhead is negligible either way, the
+ratio settles at a stable ~46.5× — the more honest read of the real
+per-MAC efficiency gap between the two kernels.
 
 **Multi-column vs. vectorized**
 
@@ -122,3 +150,30 @@ Same grid, each cell computed from the execution times above.
 | 512  | 771.3×   | 2,700.8× | 2,329.7× | 1,515.8× | 1,139.3× | —      |
 | 768  | 1,153.8× | 2,703.3× | 2,272.9× | 1,409.8× | —        | —      |
 | 1024 | 1,333.5× | 2,603.6× | 2,395.4× | —        | —        | —      |
+
+## 5. Full-array NPU vs. a single CPU core
+
+**Method**: same grid, against a real CPU baseline instead of the scalar
+NPU kernel — single-threaded `torch::conv2d`, bf16, `channels_last`
+(matching the NPU's HWC layout), timed directly in C++ via **LibTorch**
+(PyTorch's C++ core, no Python interpreter in the timed loop) so both
+sides are measured the same way, same 10 warm-up + 50 timed-run averaging
+as the NPU numbers.
+
+**Speedup (CPU / NPU, below 1× means CPU is faster)**
+
+| Channels | 16×16 | 64×64 | 78×78 | 114×114 | 174×174 | 366×366 |
+|---:|---:|---:|---:|---:|---:|---:|
+| 32   | 0.28× | 0.24× | 0.24× | 0.25× | 0.23× | 0.25× |
+| 64   | 0.28× | 0.39× | 0.44× | 0.45× | 0.45× | 0.41× |
+| 128  | 0.23× | 0.46× | 0.53× | 0.58× | 0.73× | 1.95× |
+| 256  | 0.24× | 0.80× | 0.96× | 1.19× | 2.08× | 3.27× |
+| 512  | 0.36× | 1.03× | 1.10× | 1.63× | 1.88× | —     |
+| 768  | 0.46× | 1.07× | 1.05× | 1.54× | —     | —     |
+| 1024 | 0.50× | 1.15× | 1.18× | —     | —     | —     |
+
+CPU wins in most of the grid; the NPU only pulls ahead with both high
+channel count *and* a large image — and even there, the same
+column-saturation effect noted above (Section 3) means the advantage
+doesn't always keep growing with channel count (e.g. 114×114: 512ch is
+1.63×, 768ch dips to 1.54×).
