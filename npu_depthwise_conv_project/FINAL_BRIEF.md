@@ -12,7 +12,8 @@ for the smaller channel counts, shrinking as channel count grows, down to
 `PERFORMANCE.md`.
 
 This version covers all three NPU implementations plus a comparison
-against a single CPU core.
+against a single CPU core (Section 5) and against the whole CPU, all 24
+threads (Section 6).
 
 ## 1. Scalar kernel (baseline, no parallelism)
 
@@ -177,3 +178,39 @@ channel count *and* a large image — and even there, the same
 column-saturation effect noted above (Section 3) means the advantage
 doesn't always keep growing with channel count (e.g. 114×114: 512ch is
 1.63×, 768ch dips to 1.54×).
+
+## 6. Full-array NPU vs. a fully-loaded CPU (separate comparison)
+
+Section 5 isolates architectural efficiency — one NPU column vs. one CPU
+core, no parallelism on either side. This section answers a different,
+more practical question instead: given this specific machine, is it worth
+routing this workload to the NPU at all, or just parallelizing it across
+every CPU thread available? Same grid, same LibTorch setup, but with
+`at::set_num_threads()` set to all 24 threads of this machine's CPU (AMD
+Ryzen AI 9 HX 370, 12 cores/24 threads) instead of 1.
+
+Multi-threaded timings were considerably noisier than the single-thread
+ones — up to ~4× swings between repeated full sweeps of the same grid, on
+this shared machine with a `powersave` governor. The table below is the
+**minimum across 3 full runs** per cell (interference can only slow a run
+down, never speed it up, so the minimum is the standard way to filter it
+out).
+
+**Speedup (CPU, 24 threads / NPU, below 1× means CPU is faster)**
+
+| Channels | 16×16 | 64×64 | 78×78 | 114×114 | 174×174 | 366×366 |
+|---:|---:|---:|---:|---:|---:|---:|
+| 32   | 0.39× | 0.17× | 0.14× | 0.09× | 0.06× | 0.04× |
+| 64   | 0.39× | 0.20× | 0.19× | 0.12× | 0.09× | 0.13× |
+| 128  | 0.47× | 0.26× | 0.26× | 0.19× | 0.16× | 0.52× |
+| 256  | 0.41× | 0.42× | 0.44× | 0.41× | 0.65× | 1.35× |
+| 512  | 0.43× | 0.51× | 0.39× | 0.60× | 0.97× | —     |
+| 768  | 0.40× | 0.52× | 0.47× | 0.73× | —     | —     |
+| 1024 | 0.46× | 0.52× | 0.61× | —     | —     | —     |
+
+With every CPU thread engaged, CPU wins almost everywhere — the NPU only
+pulls ahead at 256 channels/366×366 (1.35×). Worth noting: the NPU gets
+this result while leaving all 24 CPU threads free for other work, which a
+fully-loaded-CPU comparison — by construction — doesn't give credit for;
+that's the more realistic value proposition of a dedicated accelerator in
+practice, even though it isn't captured by the number itself.

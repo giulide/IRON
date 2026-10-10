@@ -1,29 +1,33 @@
 // SPDX-FileCopyrightText: Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 //
-// CPU single-thread depthwise conv2d baseline, measured entirely in C++
-// against LibTorch directly -- no Python interpreter anywhere in the timed
-// path. Mirrors the NPU-side timing methodology in iron/common/test_utils.py
-// (run_test): buffers built once, `warmup_iters` untimed calls, then
-// `timed_iters` timed calls averaged (mean, not median) with a wall clock
-// wrapped tightly around each call.
+// CPU depthwise conv2d baseline, measured entirely in C++ against LibTorch
+// directly -- no Python interpreter anywhere in the timed path. Mirrors the
+// NPU-side timing methodology in iron/common/test_utils.py (run_test):
+// buffers built once, `warmup_iters` untimed calls, then `timed_iters`
+// timed calls averaged (mean, not median) with a wall clock wrapped
+// tightly around each call.
 //
 // Same grid as FINAL_BRIEF.md Section 3 (multi-column NPU real
 // measurements): channel counts 32/64/128/256/512/768/1024, image sizes
 // 16/64/78/114/174/366 up to each channel count's max processable width.
 // Same conv parameters as the NPU design: k=3x3, padding=1, bf16,
-// channels_last (HWC-equivalent), single-threaded.
+// channels_last (HWC-equivalent). Uses every thread of the single
+// physical CPU package (see main()) -- a fully-loaded-CPU comparison,
+// distinct from the single-threaded baseline used elsewhere in this
+// project.
 
 #include <torch/torch.h>
 
 #include <chrono>
 #include <cstdio>
+#include <thread>
 #include <vector>
 
 namespace F = torch::nn::functional;
 
 double run_case(int64_t c, int64_t size, int64_t k = 3, int64_t padding = 1,
-                 int warmup_iters = 10, int timed_iters = 50) {
+                 int warmup_iters = 30, int timed_iters = 50) {
     torch::manual_seed(0);
 
     auto x = torch::randn({1, c, size, size}, torch::kBFloat16)
@@ -47,9 +51,27 @@ double run_case(int64_t c, int64_t size, int64_t k = 3, int64_t padding = 1,
 }
 
 int main() {
-    at::set_num_threads(1);  // single-threaded CPU baseline, matching the
-                              // established convention throughout this
-                              // project: no CPU-side parallelism.
+    // Use every thread of the single physical CPU package in this machine
+    // (no cross-socket spreading -- there's only one socket here anyway),
+    // instead of the single-threaded baseline used elsewhere in this
+    // project, to compare a fully-loaded CPU against the full-array NPU.
+    at::set_num_threads(std::thread::hardware_concurrency());
+
+    // Prime the OpenMP thread pool and push the CPU out of its idle/
+    // powersave clock state before any measured case -- on `powersave`
+    // governor (this machine's setting; left untouched since it's a
+    // shared box), frequency ramps up under sustained load and decays
+    // when idle, which otherwise shows up as large, non-monotonic noise
+    // on the first few small cases.
+    {
+        auto x = torch::randn({1, 256, 114, 114}, torch::kBFloat16)
+                      .contiguous(torch::MemoryFormat::ChannelsLast);
+        auto weight = torch::randn({256, 1, 3, 3}, torch::kBFloat16);
+        auto opts = F::Conv2dFuncOptions().stride(1).padding(1).groups(256);
+        for (int i = 0; i < 200; i++) {
+            auto y = F::conv2d(x, weight, opts);
+        }
+    }
 
     struct Row {
         int64_t total_c;
